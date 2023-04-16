@@ -250,7 +250,11 @@ chosen (interactively or automatically)."
                                        ("csharp-ls"))))
                                 (purescript-mode . ("purescript-language-server" "--stdio"))
                                 ((perl-mode cperl-mode) . ("perl" "-MPerl::LanguageServer" "-e" "Perl::LanguageServer::run"))
-                                (markdown-mode . ("marksman" "server")))
+                                (markdown-mode
+                                 . ,(eglot-alternatives
+                                     '(("marksman" "server")
+                                       ("vscode-markdown-language-server" "--stdio"))))
+                                (graphviz-dot-mode . ("dot-language-server" "--stdio")))
   "How the command `eglot' guesses the server to start.
 An association list of (MAJOR-MODE . CONTACT) pairs.  MAJOR-MODE
 identifies the buffers that are to be managed by a specific
@@ -844,12 +848,9 @@ treated as in `eglot--dbind'."
     :documentation "Short nickname for the associated project."
     :accessor eglot--project-nickname
     :reader eglot-project-nickname)
-   (major-modes
-    :documentation "Major modes server is responsible for in a given project."
-    :accessor eglot--major-modes)
-   (language-id
-    :documentation "Language ID string for the mode."
-    :accessor eglot--language-id)
+   (languages
+    :documentation "Alist ((MODE . LANGUAGE-ID-STRING)...) of managed languages."
+    :accessor eglot--languages)
    (capabilities
     :documentation "JSON object containing server capabilities."
     :accessor eglot--capabilities)
@@ -883,6 +884,12 @@ treated as in `eglot--dbind'."
     :accessor eglot--inferior-process))
   :documentation
   "Represents a server. Wraps a process for LSP communication.")
+
+(defun eglot--major-modes (s) "Major modes server S is responsible for."
+  (mapcar #'car (eglot--languages s)))
+
+(defun eglot--language-ids (s) "LSP Language ID strings for server S's modes."
+  (mapcar #'cdr (eglot--languages s)))
 
 (cl-defmethod initialize-instance :before ((_server eglot-lsp-server) &optional args)
   (cl-remf args :initializationOptions))
@@ -969,42 +976,44 @@ PRESERVE-BUFFERS as in `eglot-shutdown', which see."
 
 (defun eglot--lookup-mode (mode)
   "Lookup `eglot-server-programs' for MODE.
-Return (MANAGED-MODES LANGUAGE-ID CONTACT-PROXY).
+Return (LANGUAGES . CONTACT-PROXY).
 
 MANAGED-MODES is a list with MODE as its first element.
 Subsequent elements are other major modes also potentially
 managed by the server that is to manage MODE.
 
-If not specified in `eglot-server-programs' (which see),
-LANGUAGE-ID is determined from MODE's name.
+LANGUAGE-IDS is a list of the same length as MANAGED-MODES.  Each
+elem is derived from the corresponding mode name, if not
+specified in `eglot-server-programs' (which see).
 
 CONTACT-PROXY is the value of the corresponding
 `eglot-server-programs' entry."
-  (cl-loop
-   for (modes . contact) in eglot-server-programs
-   for mode-symbols = (cons mode
-                            (delete mode
-                                    (mapcar #'car
-                                            (mapcar #'eglot--ensure-list
-                                                    (eglot--ensure-list modes)))))
-   thereis (cl-some
-            (lambda (spec)
-              (cl-destructuring-bind (probe &key language-id &allow-other-keys)
-                  (eglot--ensure-list spec)
-                (and (provided-mode-derived-p mode probe)
-                     (list
-                      mode-symbols
-                      (or language-id
-                          (or (get mode 'eglot-language-id)
-                              (get spec 'eglot-language-id)
-                              (string-remove-suffix "-mode" (symbol-name mode))))
-                      contact))))
-            (if (or (symbolp modes) (keywordp (cadr modes)))
-                (list modes) modes))))
+  (cl-flet ((languages (main-mode-sym specs)
+              (let* ((res
+                      (mapcar (jsonrpc-lambda (sym &key language-id &allow-other-keys)
+                                (cons sym
+                                      (or language-id
+                                          (or (get sym 'eglot-language-id)
+                                              (replace-regexp-in-string
+                                               "\\(?:-ts\\)?-mode$" ""
+                                               (symbol-name sym))))))
+                              specs))
+                     (head (cl-find main-mode-sym res :key #'car)))
+                (cons head (delq head res)))))
+    (cl-loop
+     for (modes . contact) in eglot-server-programs
+     for specs = (mapcar #'eglot--ensure-list
+                         (if (or (symbolp modes) (keywordp (cadr modes)))
+                             (list modes) modes))
+     thereis (cl-some (lambda (spec)
+                        (cl-destructuring-bind (sym &key &allow-other-keys) spec
+                          (and (provided-mode-derived-p mode sym)
+                               (cons (languages sym specs) contact))))
+                      specs))))
 
 (defun eglot--guess-contact (&optional interactive)
   "Helper for `eglot'.
-Return (MANAGED-MODE PROJECT CLASS CONTACT LANG-ID).  If INTERACTIVE is
+Return (MANAGED-MODES PROJECT CLASS CONTACT LANG-IDS).  If INTERACTIVE is
 non-nil, maybe prompt user, else error as soon as something can't
 be guessed."
   (let* ((guessed-mode (if buffer-file-name major-mode))
@@ -1022,11 +1031,10 @@ be guessed."
            ((not guessed-mode)
             (eglot--error "Can't guess mode to manage for `%s'" (current-buffer)))
            (t guessed-mode)))
-         (triplet (eglot--lookup-mode main-mode))
-         (managed-modes (car triplet))
-         (language-id (or (cadr triplet)
-                          (string-remove-suffix "-mode" (symbol-name guessed-mode))))
-         (guess (caddr triplet))
+         (languages-and-contact (eglot--lookup-mode main-mode))
+         (managed-modes (mapcar #'car (car languages-and-contact)))
+         (language-ids (mapcar #'cdr (car languages-and-contact)))
+         (guess (cdr languages-and-contact))
          (guess (if (functionp guess)
                     (funcall guess interactive)
                   guess))
@@ -1074,7 +1082,7 @@ be guessed."
                      full-program-invocation
                      'eglot-command-history)))
               guess)))
-    (list managed-modes (eglot--current-project) class contact language-id)))
+    (list managed-modes (eglot--current-project) class contact language-ids)))
 
 (defvar eglot-lsp-context)
 (put 'eglot-lsp-context 'variable-documentation
@@ -1092,24 +1100,25 @@ suitable root directory for a given LSP server's purposes."
         `(transient . ,(expand-file-name default-directory)))))
 
 ;;;###autoload
-(defun eglot (managed-major-mode project class contact language-id
+(defun eglot (managed-major-modes project class contact language-ids
                                  &optional _interactive)
-  "Start LSP server in support of PROJECT's buffers under MANAGED-MAJOR-MODE.
+  "Start LSP server for PROJECT's buffers under MANAGED-MAJOR-MODES.
 
-This starts a Language Server Protocol (LSP) server suitable for the
-buffers of PROJECT whose `major-mode' is MANAGED-MAJOR-MODE.
-CLASS is the class of the LSP server to start and CONTACT specifies
-how to connect to the server.
+This starts a Language Server Protocol (LSP) server suitable for
+the buffers of PROJECT whose `major-mode' is among
+MANAGED-MAJOR-MODES.  CLASS is the class of the LSP server to
+start and CONTACT specifies how to connect to the server.
 
-Interactively, the command attempts to guess MANAGED-MAJOR-MODE
-from the current buffer's `major-mode', CLASS and CONTACT from
-`eglot-server-programs' looked up by the major mode, and PROJECT from
-`project-find-functions'.  The search for active projects in this
-context binds `eglot-lsp-context' (which see).
+Interactively, the command attempts to guess MANAGED-MAJOR-MODES,
+CLASS, CONTACT, and LANGUAGE-IDS from `eglot-server-programs',
+according to the current buffer's `major-mode'.  PROJECT is
+guessed from `project-find-functions'.  The search for active
+projects in this context binds `eglot-lsp-context' (which see).
 
-If it can't guess, it prompts the user for the mode and the server.
-With a single \\[universal-argument] prefix arg, it always prompts for COMMAND.
-With two \\[universal-argument], it also always prompts for MANAGED-MAJOR-MODE.
+If it can't guess, it prompts the user for the mode and the
+server.  With a single \\[universal-argument] prefix arg, it
+always prompts for COMMAND.  With two \\[universal-argument], it
+also always prompts for MANAGED-MAJOR-MODE.
 
 The LSP server of CLASS is started (or contacted) via CONTACT.
 If this operation is successful, current *and future* file
@@ -1127,8 +1136,8 @@ CONTACT specifies how to contact the server.  It is a
 keyword-value plist used to initialize CLASS or a plain list as
 described in `eglot-server-programs', which see.
 
-LANGUAGE-ID is the language ID string to send to the server for
-MANAGED-MAJOR-MODE, which matters to a minority of servers.
+LANGUAGE-IDS is a list of language ID string to send to the
+server for each element in MANAGED-MAJOR-MODES.
 
 INTERACTIVE is ignored and provided for backward compatibility."
   (interactive
@@ -1139,8 +1148,9 @@ INTERACTIVE is ignored and provided for backward compatibility."
        (user-error "[eglot] Connection attempt aborted by user."))
      (prog1 (append (eglot--guess-contact t) '(t))
        (when current-server (ignore-errors (eglot-shutdown current-server))))))
-  (eglot--connect (eglot--ensure-list managed-major-mode)
-                  project class contact language-id))
+  (eglot--connect (eglot--ensure-list managed-major-modes)
+                  project class contact
+                  (eglot--ensure-list language-ids)))
 
 (defun eglot-reconnect (server &optional interactive)
   "Reconnect to SERVER.
@@ -1152,7 +1162,7 @@ INTERACTIVE is t if called interactively."
                   (eglot--project server)
                   (eieio-object-class-name server)
                   (eglot--saved-initargs server)
-                  (eglot--language-id server))
+                  (eglot--language-ids server))
   (eglot--message "Reconnected!"))
 
 (defvar eglot--managed-mode) ; forward decl
@@ -1225,8 +1235,8 @@ Each function is passed the server as an argument")
 (defvar-local eglot--cached-server nil
   "A cached reference to the current Eglot server.")
 
-(defun eglot--connect (managed-modes project class contact language-id)
-  "Connect to MANAGED-MODES, LANGUAGE-ID, PROJECT, CLASS and CONTACT.
+(defun eglot--connect (managed-modes project class contact language-ids)
+  "Connect to MANAGED-MODES, LANGUAGE-IDS, PROJECT, CLASS and CONTACT.
 This docstring appeases checkdoc, that's all."
   (let* ((default-directory (project-root project))
          (nickname (project-name project))
@@ -1299,8 +1309,9 @@ This docstring appeases checkdoc, that's all."
     (setf (eglot--saved-initargs server) initargs)
     (setf (eglot--project server) project)
     (setf (eglot--project-nickname server) nickname)
-    (setf (eglot--major-modes server) (eglot--ensure-list managed-modes))
-    (setf (eglot--language-id server) language-id)
+    (setf (eglot--languages server)
+          (cl-loop for m in managed-modes for l in language-ids
+                   collect (cons m l)))
     (setf (eglot--inferior-process server) autostart-inferior-process)
     (run-hook-with-args 'eglot-server-initialized-hook server)
     ;; Now start the handshake.  To honor `eglot-sync-connect'
@@ -2354,7 +2365,7 @@ THINGS are either registrations or unregisterations (sic)."
   (append
    (eglot--VersionedTextDocumentIdentifier)
    (list :languageId
-         (eglot--language-id (eglot--current-server-or-lose))
+         (alist-get major-mode (eglot--languages (eglot--current-server-or-lose)))
          :text
          (eglot--widening
           (buffer-substring-no-properties (point-min) (point-max))))))
@@ -3118,56 +3129,55 @@ for which LSP on-type-formatting should be requested."
   (mapconcat #'eglot--format-markup
              (if (vectorp contents) contents (list contents)) "\n"))
 
-(defun eglot--sig-info (sig &optional _activep sig-help-active-param)
-  (eglot--dbind ((SignatureInformation) label documentation parameters activeParameter)
+(defun eglot--sig-info (sig &optional sig-active briefp)
+  (eglot--dbind ((SignatureInformation)
+                 ((:label siglabel))
+                 ((:documentation sigdoc)) parameters activeParameter)
       sig
     (with-temp-buffer
-      (save-excursion (insert label))
-      (let ((active-param (or activeParameter sig-help-active-param))
-            params-start params-end)
-        ;; Ad-hoc attempt to parse label as <name>(<params>)
+      (save-excursion (insert siglabel))
+      ;; Ad-hoc attempt to parse label as <name>(<params>)
         (when (looking-at "\\([^(]*\\)(\\([^)]+\\))")
-          (setq params-start (match-beginning 2) params-end (match-end 2))
           (add-face-text-property (match-beginning 1) (match-end 1)
                                   'font-lock-function-name-face))
-        ;; Decide whether to add one-line-summary to signature line
-        (when (and (stringp documentation)
-                   (string-match "[[:space:]]*\\([^.\r\n]+[.]?\\)"
-                                 documentation))
-          (setq documentation (match-string 1 documentation))
-          (unless (string-prefix-p (string-trim documentation) label)
-            (goto-char (point-max))
-            (insert ": " (eglot--format-markup documentation))))
-        ;; Decide what to do with the active parameter...
-        (when (and active-param (< -1 active-param (length parameters)))
-          (eglot--dbind ((ParameterInformation) label documentation)
-              (aref parameters active-param)
-            ;; ...perhaps highlight it in the formals list
-            (when params-start
-              (goto-char params-start)
-              (pcase-let
-                  ((`(,beg ,end)
-                    (if (stringp label)
-                        (let ((case-fold-search nil))
-                          (and (re-search-forward
-                                (concat "\\<" (regexp-quote label) "\\>")
-                                params-end t)
-                               (list (match-beginning 0) (match-end 0))))
-                      (mapcar #'1+ (append label nil)))))
-                (if (and beg end)
-                    (add-face-text-property
-                     beg end
-                     'eldoc-highlight-function-argument))))
-            ;; ...and/or maybe add its doc on a line by its own.
-            (when documentation
-              (goto-char (point-max))
-              (insert "\n"
-                      (propertize
-                       (if (stringp label)
-                           label
-                         (apply #'buffer-substring (mapcar #'1+ label)))
-                       'face 'eldoc-highlight-function-argument)
-                      ": " (eglot--format-markup documentation))))))
+        ;; Add documentation, indented so we can distinguish multiple signatures
+        (when-let (doc (and (not briefp) sigdoc (eglot--format-markup sigdoc)))
+          (goto-char (point-max))
+          (insert "\n" (replace-regexp-in-string "^" "  " doc)))
+        ;; Now to the parameters
+        (cl-loop
+         with active-param = (or sig-active activeParameter)
+         for i from 0 for parameter across parameters do
+         (eglot--dbind ((ParameterInformation)
+                        ((:label parlabel))
+                        ((:documentation pardoc)))
+             parameter
+           ;; ...perhaps highlight it in the formals list
+           (when (and (eq i active-param))
+             (save-excursion
+               (goto-char (point-min))
+               (pcase-let
+                   ((`(,beg ,end)
+                     (if (stringp parlabel)
+                         (let ((case-fold-search nil))
+                           (and (search-forward parlabel (line-end-position) t)
+                                (list (match-beginning 0) (match-end 0))))
+                       (mapcar #'1+ (append parlabel nil)))))
+                 (if (and beg end)
+                     (add-face-text-property
+                      beg end
+                      'eldoc-highlight-function-argument)))))
+           ;; ...and/or maybe add its doc on a line by its own.
+           (let (fpardoc)
+             (when (and pardoc (not briefp)
+                        (not (string-empty-p
+                              (setq fpardoc (eglot--format-markup pardoc)))))
+               (insert "\n  "
+                       (propertize
+                        (if (stringp parlabel) parlabel
+                          (apply #'substring siglabel (mapcar #'1+ parlabel)))
+                        'face (and (eq i active-param) 'eldoc-highlight-function-argument))
+                       ": " fpardoc)))))
       (buffer-string))))
 
 (defun eglot-signature-eldoc-function (cb)
@@ -3179,14 +3189,18 @@ for which LSP on-type-formatting should be requested."
        :textDocument/signatureHelp (eglot--TextDocumentPositionParams)
        :success-fn
        (eglot--lambda ((SignatureHelp)
-                       signatures activeSignature activeParameter)
+                       signatures activeSignature (activeParameter 0))
          (eglot--when-buffer-window buf
            (let ((active-sig (and (cl-plusp (length signatures))
                                   (aref signatures (or activeSignature 0)))))
              (if (not active-sig) (funcall cb nil)
-               (funcall cb
-                        (mapconcat #'eglot--sig-info signatures "\n")
-                        :echo (eglot--sig-info active-sig t activeParameter))))))
+               (funcall
+                cb (mapconcat (lambda (s)
+                                (eglot--sig-info s (and (eq s active-sig)
+                                                        activeParameter)
+                                                 nil))
+                              signatures "\n")
+                :echo (eglot--sig-info active-sig activeParameter t))))))
        :deferred :textDocument/signatureHelp))
     t))
 

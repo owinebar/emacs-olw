@@ -37,8 +37,8 @@
 ;; value (FIXME: like what?) in order to overwrite the default value.
 ;;
 ;; IMPORTANT: Since Eglot is a :core ELPA package, these tests are
- ;;supposed to run on Emacsen down to 26.3.  Do not use bleeding-edge
- ;;functionality not compatible with that Emacs version.
+;; supposed to run on Emacsen down to 26.3.  Do not use bleeding-edge
+;; functionality not compatible with that Emacs version.
 
 ;;; Code:
 (require 'eglot)
@@ -61,69 +61,56 @@
            (apply #'format format args)))
 
 (defmacro eglot--with-fixture (fixture &rest body)
-  "Setup FIXTURE, call BODY, teardown FIXTURE.
+  "Set up FIXTURE, call BODY, tear down FIXTURE.
 FIXTURE is a list.  Its elements are of the form (FILE . CONTENT)
 to create a readable FILE with CONTENT.  FILE may be a directory
 name and CONTENT another (FILE . CONTENT) list to specify a
-directory hierarchy.  FIXTURE's elements can also be (SYMBOL
-VALUE) meaning SYMBOL should be bound to VALUE during BODY and
-then restored."
+directory hierarchy."
   (declare (indent 1) (debug t))
-  `(eglot--call-with-fixture
-    ,fixture #'(lambda () ,@body)))
+  `(eglot--call-with-fixture ,fixture (lambda () ,@body)))
 
 (defun eglot--make-file-or-dir (ass)
-  (let ((file-or-dir-name (car ass))
+  (let ((file-or-dir-name (expand-file-name (car ass)))
         (content (cdr ass)))
     (cond ((listp content)
            (make-directory file-or-dir-name 'parents)
-           (let ((default-directory (concat default-directory "/" file-or-dir-name)))
+           (let ((default-directory (file-name-as-directory file-or-dir-name)))
              (mapcan #'eglot--make-file-or-dir content)))
           ((stringp content)
-           (with-temp-buffer
-             (insert content)
-             (write-region nil nil file-or-dir-name nil 'nomessage))
-           (list (expand-file-name file-or-dir-name)))
+           (with-temp-file file-or-dir-name
+             (insert content))
+           (list file-or-dir-name))
           (t
            (eglot--error "Expected a string or a directory spec")))))
 
 (defun eglot--call-with-fixture (fixture fn)
   "Helper for `eglot--with-fixture'.  Run FN under FIXTURE."
-  (let* ((fixture-directory (make-nearby-temp-file "eglot--fixture" t))
-         (default-directory fixture-directory)
-         file-specs created-files
-         syms-to-restore
+  (let* ((fixture-directory (make-nearby-temp-file "eglot--fixture-" t))
+         (default-directory (file-name-as-directory fixture-directory))
+         created-files
          new-servers
          test-body-successful-p)
-    (dolist (spec fixture)
-      (cond ((symbolp spec)
-             (push (cons spec (symbol-value spec)) syms-to-restore)
-             (set spec nil))
-            ((symbolp (car spec))
-             (push (cons (car spec) (symbol-value (car spec))) syms-to-restore)
-             (set (car spec) (cadr spec)))
-            ((stringp (car spec)) (push spec file-specs))))
     (eglot--test-message "[%s]: test start" (ert-test-name (ert-running-test)))
     (unwind-protect
-        (let* ((process-environment
-                (append
-                 `(;; Set XDF_CONFIG_HOME to /dev/null to prevent
-                   ;; user-configuration to have an influence on
-                   ;; language servers. (See github#441)
-                   "XDG_CONFIG_HOME=/dev/null"
-                   ;; ... on the flip-side, a similar technique by
-                   ;; Emacs's test makefiles means that HOME is
-                   ;; spoofed to /nonexistent, or sometimes /tmp.
-                   ;; This breaks some common installations for LSP
-                   ;; servers like pylsp, rust-analyzer making these
-                   ;; tests mostly useless, so we hack around it here
-                   ;; with a great big hack.
-                   ,(format "HOME=%s"
-                            (expand-file-name (format "~%s" (user-login-name)))))
-                 process-environment))
-               (eglot-server-initialized-hook
-                (lambda (server) (push server new-servers))))
-          (setq created-files (mapcan #'eglot--make-file-or-dir file-specs))
+        (let ((process-environment
+               `(;; Set XDG_CONFIG_HOME to /dev/null to prevent
+                 ;; user-configuration influencing language servers
+                 ;; (see github#441).
+                 ,(format "XDG_CONFIG_HOME=%s" null-device)
+                 ;; ... on the flip-side, a similar technique in
+                 ;; Emacs's `test/Makefile' spoofs HOME as
+                 ;; /nonexistent (and as `temporary-file-directory' in
+                 ;; `ert-remote-temporary-file-directory').
+                 ;; This breaks some common installations for LSP
+                 ;; servers like rust-analyzer, making these tests
+                 ;; mostly useless, so we hack around it here with a
+                 ;; great big hack.
+                 ,(format "HOME=%s"
+                          (expand-file-name (format "~%s" (user-login-name))))
+                 ,@process-environment))
+              (eglot-server-initialized-hook
+               (lambda (server) (push server new-servers))))
+          (setq created-files (mapcan #'eglot--make-file-or-dir fixture))
           (prog1 (funcall fn)
             (setq test-body-successful-p t)))
       (eglot--test-message "[%s]: %s" (ert-test-name (ert-running-test))
@@ -155,18 +142,15 @@ then restored."
                         (t
                          (eglot--test-message "Preserved for inspection: %s"
                                               (mapconcat #'buffer-name buffers ", "))))))))
-        (eglot--cleanup-after-test fixture-directory created-files syms-to-restore)))))
+        (eglot--cleanup-after-test fixture-directory created-files)))))
 
-(defun eglot--cleanup-after-test (fixture-directory created-files syms-to-restore)
+(defun eglot--cleanup-after-test (fixture-directory created-files)
   (let ((buffers-to-delete
-         (delete nil (mapcar #'find-buffer-visiting created-files))))
-    (eglot--test-message "Killing %s, wiping %s, restoring %s"
+         (delq nil (mapcar #'find-buffer-visiting created-files))))
+    (eglot--test-message "Killing %s, wiping %s"
                          buffers-to-delete
-                         fixture-directory
-                         (mapcar #'car syms-to-restore))
-    (cl-loop for (sym . val) in syms-to-restore
-             do (set sym val))
-    (dolist (buf buffers-to-delete) ;; have to save otherwise will get prompted
+                         fixture-directory)
+    (dolist (buf buffers-to-delete) ;; Have to save otherwise will get prompted.
       (with-current-buffer buf (save-buffer) (kill-buffer)))
     (delete-directory fixture-directory 'recursive)
     ;; Delete Tramp buffers if needed.
@@ -325,8 +309,7 @@ then restored."
   "Connect to eclipse.jdt.ls server."
   (skip-unless (executable-find "jdtls"))
   (eglot--with-fixture
-      '(("project/src/main/java/foo" . (("Main.java" . "")))
-        ("project/.git/" . nil))
+      '(("project/src/main/java/foo" . (("Main.java" . ""))))
     (with-current-buffer
         (eglot--find-file-noselect "project/src/main/java/foo/Main.java")
       (eglot--sniffing (:server-notifications s-notifs)
@@ -480,11 +463,11 @@ then restored."
           (should (eq 'eglot-diagnostic-tag-unnecessary-face (face-at-point))))))))
 
 (defun eglot--eldoc-on-demand ()
-  ;; Trick Eldoc 1.1.0 into accepting on-demand calls.
+  ;; Trick ElDoc 1.1.0 into accepting on-demand calls.
   (eldoc t))
 
 (defun eglot--tests-force-full-eldoc ()
-  ;; FIXME: This uses some Eldoc implementation defatils.
+  ;; FIXME: This uses some ElDoc implementation details.
   (when (buffer-live-p eldoc--doc-buffer)
     (with-current-buffer eldoc--doc-buffer
       (let ((inhibit-read-only t))
@@ -670,7 +653,7 @@ int main() {
       (should (string-match "^fprintf" (eglot--tests-force-full-eldoc))))))
 
 (ert-deftest eglot-test-multiline-eldoc ()
-  "Test Eldoc documentation from multiple osurces."
+  "Test ElDoc documentation from multiple osurces."
   (skip-unless (executable-find "clangd"))
   (eglot--with-fixture
       `(("project" . (("coiso.c" .
@@ -723,7 +706,7 @@ int main() {
         (eglot--sniffing (:server-notifications s-notifs)
           (should (eglot--tests-connect))
           (eglot--wait-for (s-notifs 20) (&key method &allow-other-keys)
-             (string= method "textDocument/publishDiagnostics")))
+            (string= method "textDocument/publishDiagnostics")))
         (goto-char (point-max))
         (eglot--simulate-key-event ?.)
         (should (looking-back "^    \\."))))))
@@ -821,6 +804,7 @@ int main() {
 (ert-deftest eglot-test-json-basic ()
   "Test basic autocompletion in vscode-json-languageserver."
   (skip-unless (executable-find "vscode-json-languageserver"))
+  (skip-unless (fboundp 'yas-minor-mode))
   (eglot--with-fixture
       '(("project" .
          (("p.json" . "{\"foo.b")
@@ -872,9 +856,9 @@ int main() {
   (skip-unless (executable-find "clangd"))
   (eglot--with-fixture
       `(("project" . (("foo.c" . "int foo() {return 42;}")
-                      ("bar.c" . "int bar() {return 42;}")))
-        (c-mode-hook (eglot-ensure)))
-    (let (server)
+                      ("bar.c" . "int bar() {return 42;}"))))
+    (let ((c-mode-hook '(eglot-ensure))
+          server)
       ;; need `ert-simulate-command' because `eglot-ensure'
       ;; relies on `post-command-hook'.
       (with-current-buffer
@@ -1058,7 +1042,8 @@ int main() {
 (cl-defmacro eglot--guessing-contact ((interactive-sym
                                        prompt-args-sym
                                        guessed-class-sym guessed-contact-sym
-                                       &optional guessed-lang-id-sym)
+                                       &optional guessed-major-modes-sym
+                                       guessed-lang-ids-sym)
                                       &body body)
   "Guess LSP contact with `eglot--guessing-contact', evaluate BODY.
 
@@ -1068,10 +1053,10 @@ BODY is evaluated twice, with INTERACTIVE bound to the boolean passed to
 If the user would have been prompted, PROMPT-ARGS-SYM is bound to
 the list of arguments that would have been passed to
 `read-shell-command', else nil.  GUESSED-CLASS-SYM,
-GUESSED-CONTACT-SYM and GUESSED-LANG-ID-SYM are bound to the
-useful return values of `eglot--guess-contact'.  Unless the
-server program evaluates to \"a-missing-executable.exe\", this
-macro will assume it exists."
+GUESSED-CONTACT-SYM, GUESSED-LANG-IDS-SYM and
+GUESSED-MAJOR-MODES-SYM are bound to the useful return values of
+`eglot--guess-contact'.  Unless the server program evaluates to
+\"a-missing-executable.exe\", this macro will assume it exists."
   (declare (indent 1) (debug t))
   (let ((i-sym (cl-gensym)))
     `(dolist (,i-sym '(nil t))
@@ -1087,8 +1072,9 @@ macro will assume it exists."
                          `(lambda (&rest args) (setq ,prompt-args-sym args) "")
                        `(lambda (&rest _dummy) ""))))
            (cl-destructuring-bind
-               (_ _ ,guessed-class-sym ,guessed-contact-sym
-                  ,(or guessed-lang-id-sym '_))
+               (,(or guessed-major-modes-sym '_)
+                _ ,guessed-class-sym ,guessed-contact-sym
+                  ,(or guessed-lang-ids-sym '_))
                (eglot--guess-contact ,i-sym)
              ,@body))))))
 
@@ -1183,16 +1169,17 @@ macro will assume it exists."
 (ert-deftest eglot-test-server-programs-guess-lang ()
   (let ((major-mode 'foo-mode))
     (let ((eglot-server-programs '((foo-mode . ("prog-executable")))))
-      (eglot--guessing-contact (_ nil _ _ guessed-lang)
-        (should (equal guessed-lang "foo"))))
+      (eglot--guessing-contact (_ nil _ _ _ guessed-langs)
+        (should (equal guessed-langs '("foo")))))
     (let ((eglot-server-programs '(((foo-mode :language-id "bar")
                                     . ("prog-executable")))))
-      (eglot--guessing-contact (_ nil _ _ guessed-lang)
-        (should (equal guessed-lang "bar"))))
+      (eglot--guessing-contact (_ nil _ _ _ guessed-langs)
+        (should (equal guessed-langs '("bar")))))
     (let ((eglot-server-programs '(((baz-mode (foo-mode :language-id "bar"))
                                     . ("prog-executable")))))
-      (eglot--guessing-contact (_ nil _ _ guessed-lang)
-        (should (equal guessed-lang "bar"))))))
+      (eglot--guessing-contact (_ nil _ _ modes guessed-langs)
+        (should (equal guessed-langs '("bar" "baz")))
+        (should (equal modes '(foo-mode baz-mode)))))))
 
 (defun eglot--glob-match (glob str)
   (funcall (eglot--glob-compile glob t t) str))
@@ -1288,7 +1275,7 @@ macro will assume it exists."
 (ert-deftest eglot-test-path-to-uri-windows ()
   (skip-unless (eq system-type 'windows-nt))
   (should (string-prefix-p "file:///"
-                             (eglot--path-to-uri "c:/Users/Foo/bar.lisp")))
+                           (eglot--path-to-uri "c:/Users/Foo/bar.lisp")))
   (should (string-suffix-p "c%3A/Users/Foo/bar.lisp"
                            (eglot--path-to-uri "c:/Users/Foo/bar.lisp"))))
 
@@ -1318,8 +1305,9 @@ macro will assume it exists."
         (should (eq (eglot-current-server) server))))))
 
 (provide 'eglot-tests)
-;;; eglot-tests.el ends here
 
 ;; Local Variables:
 ;; checkdoc-force-docstrings-flag: nil
 ;; End:
+
+;;; eglot-tests.el ends here
