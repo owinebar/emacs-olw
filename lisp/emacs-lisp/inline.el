@@ -266,5 +266,184 @@ See Info node `(elisp)Defining Functions' for more details."
           ;;                            inline--form)
           inline--form))
 
+(defun inline-extract-arglist (fxn-name)
+  "Construct arglist based on FXN docstring if provided in help format."
+  (let* ((s (documentation fxn-name t))
+	 (found (string-match "\n(fn \\([^\)]*\\))$" s))
+	 (n (length "\n\(fn ")))
+    (if (not found)
+	;; punt
+	'(&rest args)
+      (let ((arglist-string
+	     (format "\(%s"
+		     (downcase (substring s (+ found n))))))
+	(with-temp-buffer
+	  (insert arglist-string)
+	  (goto-char (point-min))
+	  (read (current-buffer)))))))
+
+  
+(defun inline-application-form (fxn args)
+  "Construct an application form for function FXN with argument list ARGS."
+  (let ((ls args)
+	(required 0)
+	params opt restp)
+    (while ls
+      (pcase ls
+	(`(&rest ,param)
+	 (push param params)
+	 (setq restp t)
+	 (setq ls nil))
+	(`(&rest . ,ignored)
+	 (error "argument list: %s: malformed &rest parameter %S" fxn args))
+	(`(&optional . ,ignored)
+	 (when opt
+	   (error "argument list: %s: multiple &optional markers %S"
+		  fxn args))
+	 (pop ls)
+	 (setq opt 0))
+	(`(,param . ,ignored)
+	 (push param params)
+	 (pop ls)
+	 (if opt
+	     (setq opt (1+ opt))
+	   (setq required (1+ required))))
+	(_
+	 (error "malformed argument list: %s: %S" name args))))
+    (setq params (nreverse params))
+    (unless opt
+      (setq opt 0))
+    (if restp
+	`(apply ,fxn ,@params)
+      `(,fxn ,@params))))
+
+;; Derived from inline.el
+(defun inline--testconst-exp-p (exp)
+  (or (macroexp-const-p exp)
+      (eq (car-safe exp) 'function)))
+
+(defmacro define-inline-pure-subr (name args &optional new-name)
+  "Define NEW-NAME to inline the subr currently bound to NAME.
+The function must have the signature specified by ARGS.
+This inlining enables compile-time evaluation during macroexpansion
+rather than during the byte-compiler's optimization phase.
+NEW-NAME defaults to NAME."
+  (declare (indent defun) (debug defun) (doc-string 3))
+  (when (and new-name (not (eq new-name name)))
+    (setplist new-name (seq-copy (symbol-plist name))))
+  (unless new-name
+    (setq new-name name))
+  (let ((doc (documentation name t)) 
+	(fxn (symbol-function name))
+        (cm-name (intern (format "%s--inliner" new-name)))
+	app-form)
+    (while (symbolp fxn)
+      (setq fxn (symbol-function fxn)))
+    (function-put new-name 'compiler-macro nil) ; see define-inline
+    (setq app-form (inline-application-form fxn args))
+    `(progn
+	   (,(if (memq (get name 'byte-optimizer)
+		       '(nil byte-compile-inline-expand))
+		 'defsubst
+	       'defun)
+	    ,new-name ,args ,doc
+            (declare (compiler-macro ,cm-name))
+	    ,app-form)
+       (eval-and-compile
+         (defun ,cm-name ,(cons 'inline--form args)
+	   (let* ((rands (mapcar #'macroexpand-all (cdr inline--form)))
+		  (expander-app-form `(,,fxn ,@rands)))
+	     (if (seq-every-p #'inline--testconst-exp-p rands)
+		 (let ((r
+			;; (eval expander-app-form)))
+			(apply fxn rands)))
+		   (unless (macroexp-const-p r)
+		     (setq r `(quote ,r)))
+		   r)
+	       expander-app-form)))))))
+
+(defvar inlined-primitives
+  (let (purefuncs)
+    (mapatoms (lambda (x)
+		(and (fboundp x) (get x 'pure)
+		     (push `(,x . ,x) purefuncs))))
+    ;; these are not truly pure
+    ;; make inline-* variants available for explicit use
+    (push '(format . inline-format) purefuncs)
+    (push '(intern . inline-intern) purefuncs)
+    (setq purefuncs (nreverse purefuncs))
+    (mapcar (lambda (x)
+	      `(,(car x) ,(cdr x) . ,(inline-extract-arglist (car x))))
+	    purefuncs))
+  "Association list of pure functions and their argument lists for inlining.")
+
+(mapc (lambda (pr)
+	(eval `(define-inline-pure-subr ,(car pr) ,(cddr pr) ,(cadr pr))))
+      inlined-primitives)
+
+
+
+(defmacro define-inline-pure (name args &rest body)
+  "Define NAME as inlined pure function with signature ARGS.
+BODY will be evaluated during macroexpansion if given constant arguments."
+  (declare (indent defun) (debug defun) (doc-string 3))
+  (let ((doc (if (stringp (car-safe body)) (list (pop body))))
+        (declares (if (eq (car-safe (car-safe body)) 'declare) (pop body)))
+        (cm-name (intern (format "%s--inliner" name)))
+        (bodyexp (macroexp-progn body))
+	expanded-ct-body ct-fxn app-form)
+    (function-put name 'compiler-macro nil) ; see define-inline
+    (setq app-form (inline-application-form fxn args))
+    (setq expanded-ct-body
+	  `(catch 'inline--just-use
+	     ,(macroexpand-all
+	       bodyexp
+	       `((inline-quote . inline--do-quote)
+		 ;; (inline-\` . inline--do-quote)
+		 (inline--leteval . inline--do-leteval)
+		 (inline--letlisteval
+		  . inline--do-letlisteval)
+		 (inline-const-p . inline--testconst-p)
+		 (inline-const-val . inline--getconst-val)
+		 (inline-error . inline--warning)
+		 ,@macroexpand-all-environment))))
+    ;; construct a function that should not have
+    ;; circular dependency on the function symbol
+    ;; being inlined
+    (setq ct-fxn
+	  (let ((x (cl-gensym "x-"))
+		(expanded-body
+		 `(catch 'inline--just-use
+		    ,expanded-ct-body)))
+	    (byte-compile
+	     `(lambda (,args)
+		(cl-labels ((,name ,args ,@expanded-ct-body))
+		  ,app-form)))))
+    `(progn
+       (defun ,name ,args
+	 ,@doc
+         (declare (compiler-macro ,cm-name) ,@declares)
+         ,(macroexpand-all bodyexp
+                           `((inline-quote . inline--dont-quote)
+                             ;; (inline-\` . inline--dont-quote)
+                             (inline--leteval . inline--dont-leteval)
+                             (inline--letlisteval . inline--dont-letlisteval)
+                             (inline-const-p . inline--alwaysconst-p)
+                             (inline-const-val . inline--alwaysconst-val)
+                             (inline-error . inline--error)
+                             ,@macroexpand-all-environment)))
+       (eval-and-compile
+         (defun ,cm-name ,(cons 'inline--form args)
+	   (let* ((rands (mapcar #'macroexpand-all (cdr inline--form)))
+		  (expander-app-form `(,,fxn ,@rands)))
+	     (if (seq-every-p #'inline--testconst-exp-p rands)
+		 (let ((r
+			;; (eval expander-app-form)))
+			(apply ct-fxn rands)))
+		   (unless (macroexp-const-p r)
+		     (setq r `(quote ,r)))
+		   r)
+	       ,@expanded-ct-body)))))))
+
 (provide 'inline)
 ;;; inline.el ends here
