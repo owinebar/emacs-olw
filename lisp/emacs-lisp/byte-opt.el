@@ -221,21 +221,17 @@ for speeding up processing.")
 
 (defun byte-optimize--substitutable-p (expr)
   "Whether EXPR is a constant that can be propagated."
-  ;; Only consider numbers, symbols and strings to be values for substitution
-  ;; purposes.  Numbers and symbols are immutable, and mutating string
-  ;; literals (or results from constant-evaluated string-returning functions)
-  ;; can be considered undefined.
-  ;; (What about other quoted values, like conses?)
   (or (booleanp expr)
       (numberp expr)
-      (stringp expr)
-      (and (consp expr)
-           (or (and (memq (car expr) '(quote function))
-                    (symbolp (cadr expr)))
-               ;; (internal-get-closed-var N) can be considered constant for
-               ;; const-prop purposes.
-               (and (eq (car expr) 'internal-get-closed-var)
-                    (integerp (cadr expr)))))
+      (arrayp expr)
+      (let ((head (car-safe expr)))
+        (cond ((eq head 'quote) t)
+              ;; Don't substitute #'(lambda ...) since that would enable
+              ;; uncontrolled inlining.
+              ((eq head 'function) (symbolp (cadr expr)))
+              ;; (internal-get-closed-var N) can be considered constant for
+              ;; const-prop purposes.
+              ((eq head 'internal-get-closed-var) (integerp (cadr expr)))))
       (keywordp expr)))
 
 (defmacro byte-optimize--pcase (exp &rest cases)
@@ -469,10 +465,6 @@ for speeding up processing.")
 	     form
 	   (byte-optimize-form newform for-effect))))
 
-      ;; FIXME: Strictly speaking, I think this is a bug: (closure...)
-      ;; is a *value* and shouldn't appear in the car.
-      (`((closure . ,_) . ,_) form)
-
       (`(setq ,var ,expr)
        (let ((lexvar (assq var byte-optimize--lexvars))
              (value (byte-optimize-form expr nil)))
@@ -500,7 +492,7 @@ for speeding up processing.")
        (cons fn (mapcar #'byte-optimize-form exps)))
 
       (`(,(pred (not symbolp)) . ,_)
-       (byte-compile-warn-x fn "`%s' is a malformed function" fn)
+       (byte-compile-warn-x form "`%s' is a malformed function" fn)
        form)
 
       ((guard (when for-effect
@@ -1420,10 +1412,13 @@ See Info node `(elisp) Integer Basics'."
 
 
 (defun byte-optimize-funcall (form)
-  ;; (funcall (lambda ...) ...) ==> ((lambda ...) ...)
-  ;; (funcall foo ...) ==> (foo ...)
-  (let ((fn (nth 1 form)))
-    (if (memq (car-safe fn) '(quote function))
+  ;; (funcall #'(lambda ...) ...) -> ((lambda ...) ...)
+  ;; (funcall #'SYM ...) -> (SYM ...)
+  ;; (funcall 'SYM ...)  -> (SYM ...)
+  (let* ((fn (nth 1 form))
+         (head (car-safe fn)))
+    (if (or (eq head 'function)
+            (and (eq head 'quote) (symbolp (nth 1 fn))))
 	(cons (nth 1 fn) (cdr (cdr form)))
       form)))
 
@@ -1520,6 +1515,44 @@ See Info node `(elisp) Integer Basics'."
   ;; (list) -> nil
   (and (cdr form) form))
 
+(put 'nconc 'byte-optimizer #'byte-optimize-nconc)
+(defun byte-optimize-nconc (form)
+  (pcase (cdr form)
+    ('nil nil)                          ; (nconc) -> nil
+    (`(,x) x)                           ; (nconc X) -> X
+    (_ (named-let loop ((args (cdr form)) (newargs nil))
+         (if args
+             (let ((arg (car args))
+                   (prev (car newargs)))
+               (cond
+                ;; Elide null args.
+                ((and (null arg)
+                      ;; Don't elide a terminal nil unless preceded by
+                      ;; a nonempty proper list, since that will have
+                      ;; its last cdr forced to nil.
+                      (or (cdr args)
+                          ;; FIXME: prove the 'nonempty proper list' property
+                          ;; for more forms than just `list', such as
+                          ;; `append', `mapcar' etc.
+                          (eq 'list (car-safe (car newargs)))))
+                 (loop (cdr args) newargs))
+                ;; Merge consecutive `list' args.
+                ((and (eq (car-safe arg) 'list)
+                      (eq (car-safe prev) 'list))
+                 (loop (cons (cons (car prev) (append (cdr prev) (cdr arg)))
+                             (cdr args))
+                       (cdr newargs)))
+                ;; (nconc ... (list A) B ...) -> (nconc ... (cons A B) ...)
+                ((and (eq (car-safe prev) 'list) (cdr prev) (null (cddr prev)))
+                 (loop (cdr args)
+                       (cons (list 'cons (cadr prev) arg)
+                             (cdr newargs))))
+                (t (loop (cdr args) (cons arg newargs)))))
+           (let ((new-form (cons (car form) (nreverse newargs))))
+             (if (equal new-form form)
+                 form
+               new-form)))))))
+
 (put 'append 'byte-optimizer #'byte-optimize-append)
 (defun byte-optimize-append (form)
   ;; There is (probably) too much code relying on `append' to return a
@@ -1572,11 +1605,9 @@ See Info node `(elisp) Integer Basics'."
             ;; (append X) -> X
             ((null newargs) arg)
 
-            ;; (append (list Xs...) nil) -> (list Xs...)
-            ((and (null arg)
-                  newargs (null (cdr newargs))
-                  (consp prev) (eq (car prev) 'list))
-             prev)
+            ;; (append ... (list Xs...) nil) -> (append ... (list Xs...))
+            ((and (null arg) (eq (car-safe prev) 'list))
+             (cons (car form) (nreverse newargs)))
 
             ;; (append '(X) Y)     -> (cons 'X Y)
             ;; (append (list X) Y) -> (cons X Y)
@@ -1587,13 +1618,13 @@ See Info node `(elisp) Integer Basics'."
                               (= (length (cadr prev)) 1)))
                         ((eq (car prev) 'list)
                          (= (length (cdr prev)) 1))))
-             (list 'cons (if (eq (car prev) 'quote)
-                             (macroexp-quote (caadr prev))
-                           (cadr prev))
-                   arg))
+             `(cons ,(if (eq (car prev) 'quote)
+                         (macroexp-quote (caadr prev))
+                       (cadr prev))
+                    ,arg))
 
             (t
-             (let ((new-form (cons 'append (nreverse (cons arg newargs)))))
+             (let ((new-form (cons (car form) (nreverse (cons arg newargs)))))
                (if (equal new-form form)
                    form
                  new-form))))))))

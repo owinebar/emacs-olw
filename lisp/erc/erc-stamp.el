@@ -165,11 +165,17 @@ from entering them and instead jump over them."
   ((add-hook 'erc-mode-hook #'erc-munge-invisibility-spec)
    (add-hook 'erc-insert-modify-hook #'erc-add-timestamp t)
    (add-hook 'erc-send-modify-hook #'erc-add-timestamp t)
-   (add-hook 'erc-mode-hook #'erc-stamp--recover-on-reconnect))
+   (add-hook 'erc-mode-hook #'erc-stamp--recover-on-reconnect)
+   (unless erc--updating-modules-p
+     (erc-buffer-filter #'erc-munge-invisibility-spec)))
   ((remove-hook 'erc-mode-hook #'erc-munge-invisibility-spec)
    (remove-hook 'erc-insert-modify-hook #'erc-add-timestamp)
    (remove-hook 'erc-send-modify-hook #'erc-add-timestamp)
-   (remove-hook 'erc-mode-hook #'erc-stamp--recover-on-reconnect)))
+   (remove-hook 'erc-mode-hook #'erc-stamp--recover-on-reconnect)
+   (erc-with-all-buffers-of-server nil nil
+     (kill-local-variable 'erc-timestamp-last-inserted)
+     (kill-local-variable 'erc-timestamp-last-inserted-left)
+     (kill-local-variable 'erc-timestamp-last-inserted-right))))
 
 (defun erc-stamp--recover-on-reconnect ()
   (when-let ((priors (or erc--server-reconnecting erc--target-priors)))
@@ -198,13 +204,15 @@ may not be unique, `equal'-wise."
 
 This function is meant to be called from `erc-insert-modify-hook'
 or `erc-send-modify-hook'."
-  (unless (get-text-property (point-min) 'invisible)
+  (progn ; remove this `progn' on next major refactor
     (let* ((ct (erc-stamp--current-time))
+           (invisible (get-text-property (point-min) 'invisible))
            (erc-stamp--current-time ct))
-      (funcall erc-insert-timestamp-function
-               (erc-format-timestamp ct erc-timestamp-format))
+      (unless invisible
+        (funcall erc-insert-timestamp-function
+                 (erc-format-timestamp ct erc-timestamp-format)))
       ;; FIXME this will error when advice has been applied.
-      (when (and (fboundp erc-insert-away-timestamp-function)
+      (when (and (not invisible) (fboundp erc-insert-away-timestamp-function)
 		 erc-away-timestamp-format
 		 (erc-away-time)
 		 (not erc-timestamp-format))

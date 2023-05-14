@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2018-2023 Free Software Foundation, Inc.
 
-;; Version: 1.14
+;; Version: 1.15
 ;; Author: João Távora <joaotavora@gmail.com>
 ;; Maintainer: João Távora <joaotavora@gmail.com>
 ;; URL: https://github.com/joaotavora/eglot
@@ -215,11 +215,11 @@ chosen (interactively or automatically)."
                                 ((R-mode ess-r-mode) . ("R" "--slave" "-e"
                                                         "languageserver::run()"))
                                 ((java-mode java-ts-mode) . ("jdtls"))
-                                (dart-mode . ("dart" "language-server"
-                                              "--client-id" "emacs.eglot-dart"))
+                                ((dart-mode dart-ts-mode)
+                                 . ("dart" "language-server"
+                                    "--client-id" "emacs.eglot-dart"))
                                 ((elixir-mode elixir-ts-mode heex-ts-mode)
-                                 . ,(if (and (fboundp 'w32-shell-dos-semantics)
-                                             (w32-shell-dos-semantics))
+                                 . ,(if (and (fboundp 'w32-shell-dos-semantics)                                             (w32-shell-dos-semantics))
                                         '("language_server.bat")
                                       '("language_server.sh")))
                                 (ada-mode . ("ada_language_server"))
@@ -724,8 +724,23 @@ treated as in `eglot--dbind'."
 (cl-defgeneric eglot-handle-notification (server method &rest params)
   "Handle SERVER's METHOD notification with PARAMS.")
 
-(cl-defgeneric eglot-execute-command (server command arguments)
-  "Ask SERVER to execute COMMAND with ARGUMENTS.")
+(cl-defgeneric eglot-execute-command (_ _ _)
+  (declare (obsolete eglot-execute "30.1"))
+  (:method
+   (server command arguments)
+   (eglot--request server :workspace/executeCommand
+                   `(:command ,(format "%s" command) :arguments ,arguments))))
+
+(cl-defgeneric eglot-execute (server action)
+  "Ask SERVER to execute ACTION.
+ACTION is an LSP object of either `CodeAction' or `Command' type."
+  (:method
+   (server action) "Default implementation."
+   (eglot--dcase action
+     (((Command)) (eglot--request server :workspace/executeCommand action))
+     (((CodeAction) edit command)
+      (when edit (eglot--apply-workspace-edit edit))
+      (when command (eglot--request server :workspace/executeCommand action))))))
 
 (cl-defgeneric eglot-initialization-options (server)
   "JSON object to send under `initializationOptions'."
@@ -830,7 +845,8 @@ treated as in `eglot--dbind'."
                                        `(:valueSet
                                          [,@(mapcar
                                              #'car eglot--tag-faces)])))
-            :window `(:workDoneProgress t)
+            :window `(:showDocument (:support t)
+                      :workDoneProgress t)
             :general (list :positionEncodings ["utf-32" "utf-8" "utf-16"])
             :experimental eglot--{})))
 
@@ -1707,7 +1723,7 @@ under cursor."
           (const :tag "Go to definition" :definitionProvider)
           (const :tag "Go to type definition" :typeDefinitionProvider)
           (const :tag "Go to implementation" :implementationProvider)
-          (const :tag "Go to declaration" :implementationProvider)
+          (const :tag "Go to declaration" :declarationProvider)
           (const :tag "Find references" :referencesProvider)
           (const :tag "Highlight symbols automatically" :documentHighlightProvider)
           (const :tag "List symbols in buffer" :documentSymbolProvider)
@@ -1935,10 +1951,9 @@ Use `eglot-managed-p' to determine if current buffer is managed.")
   "Return logical Eglot server for current buffer, nil if none."
   (setq eglot--cached-server
         (or eglot--cached-server
-            (cl-find major-mode
-                     (gethash (eglot--current-project) eglot--servers-by-project)
-                     :key #'eglot--major-modes
-                     :test #'memq)
+            (cl-find-if #'eglot--languageId
+                        (gethash (eglot--current-project)
+                                 eglot--servers-by-project))
             (and eglot-extend-to-xref
                  buffer-file-name
                  (gethash (expand-file-name buffer-file-name)
@@ -2002,6 +2017,19 @@ If it is activated, also signal textDocument/didOpen."
 (defun eglot-manual () "Read Eglot's manual."
        (declare (obsolete info "1.10"))
        (interactive) (info "(eglot)"))
+
+;;;###autoload
+(defun eglot-upgrade-eglot (&rest _) "Update Eglot to latest version."
+  (interactive)
+  (with-no-warnings
+    (require 'package)
+    (unless package-archive-contents (package-refresh-contents))
+    (when-let ((existing (cadr (assoc 'eglot package-alist))))
+      (package-delete existing t))
+    (package-install (cadr (assoc 'eglot package-archive-contents)))))
+
+;;;###autoload
+(define-obsolete-function-alias 'eglot-update 'eglot-upgrade-eglot "29.1")
 
 (easy-menu-define eglot-menu nil "Eglot"
   `("Eglot"
@@ -2169,13 +2197,6 @@ still unanswered LSP requests to the server\n")))
   (when (memq 'disallow-unknown-methods eglot-strict-mode)
     (jsonrpc-error "Unknown request method `%s'" method)))
 
-(cl-defmethod eglot-execute-command
-  (server command arguments)
-  "Execute COMMAND on SERVER with `:workspace/executeCommand'.
-COMMAND is a symbol naming the command."
-  (eglot--request server :workspace/executeCommand
-                  `(:command ,(format "%s" command) :arguments ,arguments)))
-
 (cl-defmethod eglot-handle-notification
   (_server (_method (eql window/showMessage)) &key type message)
   "Handle notification window/showMessage."
@@ -2228,7 +2249,7 @@ COMMAND is a symbol naming the command."
                   ((eq (car pr) 'eglot--mode-line-reporter)
                    (setcdr (cddr pr) (list msg pcnt))
                    (force-mode-line-update t))
-                  (pr (progress-reporter-update pr pcnt msg)))))
+                  (pr (eglot--reporter-update pr pcnt msg)))))
       (eglot--dbind ((WorkDoneProgress) kind title percentage message) value
         (pcase kind
           ("begin"
@@ -2346,6 +2367,28 @@ THINGS are either registrations or unregisterations (sic)."
   "Handle server request workspace/workspaceFolders."
   (eglot-workspace-folders server))
 
+(cl-defmethod eglot-handle-request
+  (_server (_method (eql window/showDocument)) &key
+           uri external takeFocus selection)
+  "Handle request window/showDocument."
+  (if (eq external t) (browse-url uri)
+    ;; Use run-with-timer to avoid nested client requests like the
+    ;; synchronous imenu case caused by which-func-mode.
+    (run-with-timer
+     0 nil
+     (lambda ()
+       (with-current-buffer (find-file-noselect (eglot--uri-to-path uri))
+         (cond (takeFocus
+                (pop-to-buffer (current-buffer))
+                (select-frame-set-input-focus (selected-frame)))
+               ((display-buffer (current-buffer))))
+         (when selection
+           (eglot--widening
+            (pcase-let ((`(,beg . ,end) (eglot--range-region selection)))
+              (goto-char beg)
+              (pulse-momentary-highlight-region beg end 'highlight))))))))
+  '(:success t))
+
 (defun eglot--TextDocumentIdentifier ()
   "Compute TextDocumentIdentifier object for current buffer."
   `(:uri ,(eglot--path-to-uri (or buffer-file-name
@@ -2360,12 +2403,20 @@ THINGS are either registrations or unregisterations (sic)."
   (append (eglot--TextDocumentIdentifier)
           `(:version ,eglot--versioned-identifier)))
 
+(cl-defun eglot--languageId (&optional (server (eglot--current-server-or-lose)))
+  "Compute LSP \\='languageId\\=' string for current buffer.
+Doubles as an predicate telling if SERVER can manage current
+buffer."
+  (cl-loop for (mode . languageid) in
+           (eglot--languages server)
+           when (provided-mode-derived-p major-mode mode)
+           return languageid))
+
 (defun eglot--TextDocumentItem ()
   "Compute TextDocumentItem object for current buffer."
   (append
    (eglot--VersionedTextDocumentIdentifier)
-   (list :languageId
-         (alist-get major-mode (eglot--languages (eglot--current-server-or-lose)))
+   (list :languageId (eglot--languageId)
          :text
          (eglot--widening
           (buffer-substring-no-properties (point-min) (point-max))))))
@@ -3122,8 +3173,7 @@ for which LSP on-type-formatting should be requested."
                         (funcall snippet-fn (or insertText label))))
                  (when (cl-plusp (length additionalTextEdits))
                    (eglot--apply-text-edits additionalTextEdits)))
-               (eglot--signal-textDocument/didChange)
-               (eldoc)))))))))
+               (eglot--signal-textDocument/didChange)))))))))
 
 (defun eglot--hover-info (contents &optional _range)
   (mapconcat #'eglot--format-markup
@@ -3325,7 +3375,7 @@ Returns a list as described in docstring of `imenu--index-alist'."
                         (save-restriction
                           (narrow-to-region beg end)
                           (replace-buffer-contents temp)))
-                      (progress-reporter-update reporter (cl-incf done)))))))
+                      (eglot--reporter-update reporter (cl-incf done)))))))
             (mapcar (eglot--lambda ((TextEdit) range newText)
                       (cons newText (eglot--range-region range 'markers)))
                     (reverse edits)))
@@ -3446,14 +3496,7 @@ at point.  With prefix argument, prompt for ACTION-KIND."
                                           default-action)
                                   menu-items nil t nil nil default-action)
                                  menu-items))))))
-    (eglot--dcase chosen
-      (((Command) command arguments)
-       (eglot-execute-command server (intern command) arguments))
-      (((CodeAction) edit command)
-       (when edit (eglot--apply-workspace-edit edit))
-       (when command
-         (eglot--dbind ((Command) command arguments) command
-           (eglot-execute-command server (intern command) arguments)))))))
+    (eglot-execute server chosen)))
 
 (defmacro eglot--code-action (name kind)
   "Define NAME to execute KIND code action."
@@ -3736,7 +3779,19 @@ If NOERROR, return predicate, else erroring function."
      :success-fn (lambda (hints)
                    (eglot--when-live-buffer buf
                      (eglot--widening
-                      (remove-overlays from to 'eglot--inlay-hint t)
+                      ;; Overlays ending right at FROM with an
+                      ;; `after-string' property logically belong to
+                      ;; the (FROM TO) region.  Likewise, such
+                      ;; overlays ending at TO don't logically belong
+                      ;; to it.
+                      (dolist (o (overlays-in (1- from) to))
+                        (when (and (overlay-get o 'eglot--inlay-hint)
+                                   (cond ((eq (overlay-end o) from)
+                                          (overlay-get o 'after-string))
+                                         ((eq (overlay-end o) to)
+                                          (overlay-get o 'before-string))
+                                         (t)))
+                          (delete-overlay o)))
                       (mapc paint-hint hints))))
      :deferred 'eglot--update-hints-1)))
 

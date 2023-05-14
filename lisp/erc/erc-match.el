@@ -54,6 +54,8 @@ you can decide whether the entire message or only the sending nick is
 highlighted."
   ((add-hook 'erc-insert-modify-hook #'erc-match-message 'append)
    (add-hook 'erc-mode-hook #'erc-match--modify-invisibility-spec)
+   (unless erc--updating-modules-p
+     (erc-buffer-filter #'erc-match--modify-invisibility-spec))
    (erc--modify-local-map t "C-c C-k" #'erc-go-to-log-matches-buffer))
   ((remove-hook 'erc-insert-modify-hook #'erc-match-message)
    (remove-hook 'erc-mode-hook #'erc-match--modify-invisibility-spec)
@@ -654,6 +656,8 @@ See `erc-log-match-format'."
 
 (defvar-local erc-match--hide-fools-offset-bounds nil)
 
+;; FIXME this should merge with instead of overwrite existing
+;; `invisible' values.
 (defun erc-hide-fools (match-type _nickuserhost _message)
  "Hide foolish comments.
 This function should be called from `erc-text-matched-hook'."

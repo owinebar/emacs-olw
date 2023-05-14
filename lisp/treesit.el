@@ -251,8 +251,7 @@ than using NODE's type.  PRED can also be a predicate function,
 and more.  See `treesit-thing-settings' for details.
 
 If INCLUDE-NODE is non-nil, return NODE if it satisfies PRED."
-  (let ((pred (or pred (rx-to-string
-                        `(bos ,(treesit-node-type node) eos))))
+  (let ((pred (or pred (rx bos (literal (treesit-node-type node)) eos)))
         (result nil))
     (cl-loop for cursor = (if include-node node
                             (treesit-node-parent node))
@@ -421,13 +420,16 @@ See `treesit-query-capture' for QUERY."
 (defun treesit-query-range (node query &optional beg end)
   "Query the current buffer and return ranges of captured nodes.
 
-QUERY, NODE, BEG, END are the same as in
-`treesit-query-capture'.  This function returns a list
-of (START . END), where START and END specifics the range of each
-captured node.  Capture names don't matter."
+QUERY, NODE, BEG, END are the same as in `treesit-query-capture'.
+This function returns a list of (START . END), where START and
+END specifics the range of each captured node.  Capture names
+generally don't matter, but names that starts with an underscore
+are ignored."
   (cl-loop for capture
            in (treesit-query-capture node query beg end)
+           for name = (car capture)
            for node = (cdr capture)
+           if (not (string-prefix-p "_" (symbol-name name)))
            collect (cons (treesit-node-start node)
                          (treesit-node-end node))))
 
@@ -441,6 +443,9 @@ When updating the range of each parser in the buffer,
 `treesit-update-ranges' queries each QUERY, and sets LANGUAGE's
 range to the range spanned by captured nodes.  QUERY must be a
 compiled query.
+
+Capture names generally don't matter, but names that starts with
+an underscore are ignored.
 
 QUERY can also be a function, in which case it is called with 2
 arguments, START and END.  It should ensure parsers' ranges are
@@ -460,6 +465,9 @@ like this:
 
 Each QUERY is a tree-sitter query in either the string,
 s-expression or compiled form.
+
+Capture names generally don't matter, but names that starts with
+an underscore are ignored.
 
 For each QUERY, :KEYWORD and VALUE pairs add meta information to
 it.  For example,
@@ -1944,6 +1952,10 @@ This is a tree-sitter equivalent of `beginning-of-defun'.
 Behavior of this function depends on `treesit-defun-type-regexp'
 and `treesit-defun-skipper'."
   (interactive "^p")
+  (or (not (eq this-command 'treesit-beginning-of-defun))
+      (eq last-command 'treesit-beginning-of-defun)
+      (and transient-mark-mode mark-active)
+      (push-mark))
   (let ((orig-point (point))
         (success nil))
     (catch 'done
@@ -1975,6 +1987,10 @@ this function depends on `treesit-defun-type-regexp' and
   (interactive "^p\nd")
   (let ((orig-point (point)))
     (if (or (null arg) (= arg 0)) (setq arg 1))
+    (or (not (eq this-command 'treesit-end-of-defun))
+        (eq last-command 'treesit-end-of-defun)
+        (and transient-mark-mode mark-active)
+        (push-mark))
     (catch 'done
       (dotimes (_ 2) ; Not making progress is better than infloop.
 
@@ -2744,7 +2760,6 @@ in the region."
 
 (defun treesit--explorer-jump (button)
   "Mark the original text corresponding to BUTTON."
-  (interactive)
   (when (and (derived-mode-p 'treesit--explorer-tree-mode)
              (buffer-live-p treesit--explorer-source-buffer))
     (with-current-buffer treesit--explorer-source-buffer
@@ -2994,37 +3009,48 @@ See `treesit-language-source-alist' for details."
   "History for OUT-DIR for `treesit-install-language-grammar'.")
 
 ;;;###autoload
-(defun treesit-install-language-grammar (lang)
+(defun treesit-install-language-grammar (lang &optional out-dir)
   "Build and install the tree-sitter language grammar library for LANG.
 
 Interactively, if `treesit-language-source-alist' doesn't already
 have data for building the grammar for LANG, prompt for its
-repository URL and the C/C++ compiler to use.
+repository URL and the C/C++ compiler to use.  Non-interactively,
+signal an error when there's no recipe for LANG.
 
 This command requires Git, a C compiler and (sometimes) a C++ compiler,
 and the linker to be installed and on PATH.  It also requires that the
 recipe for LANG exists in `treesit-language-source-alist'.
 
 See `exec-path' for the current path where Emacs looks for
-executable programs, such as the C/C++ compiler and linker."
+executable programs, such as the C/C++ compiler and linker.
+
+Interactively, prompt for the directory in which to install the
+compiled grammar files.  Non-interactively, use OUT-DIR; if it's
+nil, the grammar is installed to the standard location, the
+\"tree-sitter\" directory under `user-emacs-directory'."
   (interactive (list (intern
                       (completing-read
                        "Language: "
-                       (mapcar #'car treesit-language-source-alist)))))
+                       (mapcar #'car treesit-language-source-alist)))
+                     'interactive))
   (when-let ((recipe
               (or (assoc lang treesit-language-source-alist)
-                  (treesit--install-language-grammar-build-recipe
-                   lang)))
+                  (if (eq out-dir 'interactive)
+                      (treesit--install-language-grammar-build-recipe
+                       lang)
+                    (signal 'treesit-error `("Cannot find recipe for this language" ,lang)))))
              (default-out-dir
               (or (car treesit--install-language-grammar-out-dir-history)
                   (locate-user-emacs-file "tree-sitter")))
              (out-dir
-              (read-string
-               (format "Install to (default: %s): "
-                       default-out-dir)
-               nil
-               'treesit--install-language-grammar-out-dir-history
-               default-out-dir)))
+              (if (eq out-dir 'interactive)
+                  (read-string
+                   (format "Install to (default: %s): "
+                           default-out-dir)
+                   nil
+                   'treesit--install-language-grammar-out-dir-history
+                   default-out-dir)
+                out-dir)))
     (condition-case err
         (apply #'treesit--install-language-grammar-1
                (cons out-dir recipe))
