@@ -18249,6 +18249,18 @@ See Info node `(elisp)Defining Functions' for more details.
 (fn NAME ARGS &rest BODY)" nil t)
 (function-put 'define-inline 'lisp-indent-function 'defun)
 (function-put 'define-inline 'doc-string-elt 3)
+
+
+(autoload 'define-inline-pure-subr "inline" "\
+Define NEW-NAME to inline the subr currently bound to NAME.
+The function must have the signature specified by ARGS.
+This inlining enables compile-time evaluation during macroexpansion
+rather than during the byte-compiler's optimization phase.
+NEW-NAME defaults to NAME.")
+
+(defvar inline--inlined-primitives nil "\
+Association list of pure functions and their argument lists for inlining.")
+
 (register-definition-prefixes "inline" '("inline-"))
 
 

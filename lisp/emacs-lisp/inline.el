@@ -283,8 +283,8 @@ See Info node `(elisp)Defining Functions' for more details."
 	  (read (current-buffer)))))))
 
   
-(defun inline-application-form (fxn args)
-  "Construct an application form for function FXN with argument list ARGS."
+(defun inline-application-form (fxn args &optional rands)
+  "Construct an application form for function FXN with argument list ARGS and operands RANDS."
   (let ((ls args)
 	(required 0)
 	params opt restp)
@@ -311,19 +311,30 @@ See Info node `(elisp)Defining Functions' for more details."
 	(_
 	 (error "malformed argument list: %s: %S" fxn args))))
     (setq params (nreverse params))
-    (unless (subrp fxn)
+    (unless (or (subrp fxn)
+                (byte-code-function-p fxn)
+                (compiled-function-p fxn)
+                (symbolp fxn)
+                (and (consp fxn)
+                     (eq (car fxn) 'function)))
       (setq fxn (list 'function fxn)))
     (unless opt
       (setq opt 0))
-    (if restp
-	`(apply ,fxn ,@params)
-      `(,fxn ,@params))))
+    (if rands
+        (progn
+          ;; (display-warning '(inline)
+          ;;                  (format "Source operands: %S %S" fxn rands))
+          `(,fxn ,@rands))
+      (if restp
+	  `(apply ,(if (symbolp fxn) `#',fxn fxn) ,@params)
+        `(,fxn ,@params)))))
 
 ;; Derived from inline.el
 (defun inline--testconst-exp-p (exp)
   (or (macroexp-const-p exp)
       (eq (car-safe exp) 'function)))
 
+;;;###autoload
 (defmacro define-inline-pure-subr (name args &optional new-name)
   "Define NEW-NAME to inline the subr currently bound to NAME.
 The function must have the signature specified by ARGS.
@@ -331,48 +342,76 @@ This inlining enables compile-time evaluation during macroexpansion
 rather than during the byte-compiler's optimization phase.
 NEW-NAME defaults to NAME."
   (declare (indent defun) (debug defun) (doc-string 3))
+  ;; (message "Redefining as inline %s %S %s" name args new-name)
   (when (and new-name (not (eq new-name name)))
     (setplist new-name (seq-copy (symbol-plist name))))
   (unless new-name
     (setq new-name name))
   (let ((doc (documentation name t)) 
 	(fxn (symbol-function name))
+        (fxn-sym (intern (format "inline-%s" new-name)))
         (cm-name (intern (format "%s--inliner" new-name)))
 	app-form)
     (while (symbolp fxn)
       (setq fxn (symbol-function fxn)))
-    (unless (subrp fxn)
+    (unless (or (subrp fxn)
+                (byte-code-function-p fxn)
+                (compiled-function-p fxn)
+                (and (consp fxn)
+                     (or (eq (car fxn) 'function)
+                         (eq (car fxn) 'lambda))))
       (setq fxn (list 'function fxn)))
     (function-put new-name 'compiler-macro nil) ; see define-inline
-    (setq app-form (inline-application-form fxn args))
+    (setq app-form (inline-application-form fxn-sym args))
+    (fset fxn-sym fxn)
     `(progn
-	   (,(if (memq (get name 'byte-optimizer)
-		       '(nil byte-compile-inline-expand))
-		 'defsubst
-	       'defun)
-	    ,new-name ,args ,doc
-            (declare (compiler-macro ,cm-name))
-	    ,app-form)
+       (fset ',fxn-sym ,fxn)
+       (defun ,new-name ,args
+         ,doc
+         (fset ',fxn-sym ,fxn)
+         ,(if (eq new-name name)
+              `(progn
+                 (fset ',new-name ,fxn)
+                 ;; see define-inline
+                 (function-put ',new-name 'compiler-macro ',cm-name))
+            ;; first pass ensure definition of underlying function
+            ;; then redefine to bypass this trampoline
+            `(,(if (memq (get name 'byte-optimizer)
+		         '(nil byte-compile-inline-expand))
+		   'defsubst
+	         'defun)
+	      ,new-name ,args ,doc
+              (declare (compiler-macro ,cm-name))
+	      ,app-form))
+         ,app-form)
        (eval-and-compile
          (defun ,cm-name ,(cons 'inline--form args)
-	   (let* ((rands (mapcar #'macroexpand-all (cdr inline--form)))
-		  (expander-app-form `(,,fxn ,@rands)))
-	     (if (seq-every-p #'inline--testconst-exp-p rands)
-		 (let ((r
-			;; (eval expander-app-form)))
-			(apply fxn
-                               rands)))
-		   (unless (macroexp-const-p r)
-		     (setq r `(quote ,r)))
-		   r)
-	       expander-app-form)))))))
+           (fset ',fxn-sym ,fxn)
+           (defun ,cm-name ,(cons 'inline--form args)
+	     (let* ((rands (mapcar #'macroexpand-all (cdr inline--form)))
+		    (expander-app-form
+                     `(,',fxn-sym ,@rands)))
+	       (if (seq-every-p #'inline--testconst-exp-p rands)
+                   (progn
+		     (let ((r (eval expander-app-form)))
+		       (unless (macroexp-const-p r)
+		         (setq r `(quote ,r)))
+		       r))
+	         inline--form)))
+           ,(inline-application-form cm-name (cons 'inline--form args))))
+       (function-put ',new-name 'compiler-macro ',cm-name))))
 
-(defvar inlined-primitives nil
+;;;###autoload
+(defvar inline--inlined-primitives nil
   "Association list of pure functions and their argument lists for inlining.")
-(with-eval-after-load "bytecomp"
-  (when (and (featurep 'bytecomp)
-             (fboundp 'function-documentation))
-    (setq inlined-primitives
+
+(defvar inline--defining-inlines nil)
+(defun inline-all-pure-functions ()
+  "Create macro-expansion evaluating versions of known pure functions.
+These inline versions reduce constant arguments at macro-expansion time without
+involvement of the byte-compiler."
+  (let ((inline--defining-inlines t))
+    (setq inline--inlined-primitives
           (let (purefuncs)
             (mapatoms (lambda (x)
 		        (and (fboundp x) (get x 'pure)
@@ -384,12 +423,16 @@ NEW-NAME defaults to NAME."
             (setq purefuncs (nreverse purefuncs))
             (mapcar (lambda (x)
 	              `(,(car x) ,(cdr x) . ,(inline-extract-arglist (car x))))
-	            purefuncs)))
+	            purefuncs))))
 
     (mapc (lambda (pr)
 	    (eval `(define-inline-pure-subr ,(car pr) ,(cddr pr) ,(cadr pr))))
-          inlined-primitives)))
+          inline--inlined-primitives))
 
+(when (and (or (featurep 'bytecomp) (featurep 'byte-opt))
+           (fboundp 'function-documentation)
+           (not inline--defining-inlines))
+  (inline-all-pure-functions))
 
 ;; (defmacro define-inline-pure (name args &rest body)
 ;;   "Define NAME as inlined pure function with signature ARGS.
